@@ -13,8 +13,6 @@ AI-powered assistant that converts PDFs into interactive study tools using a RAG
   * Revision notes
 * **Mind Maps**
   Visual representation of topic hierarchies
-* **Question Predictor (USP)**
-  Identifies high- and medium-probability exam questions
 ---
 ## Architecture
 
