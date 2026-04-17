@@ -3,6 +3,7 @@ import json
 import uuid
 from typing import List
 from fastapi import FastAPI, UploadFile, File
+from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 import pypdf
 from gtts import gTTS
@@ -15,6 +16,15 @@ load_dotenv()
 
 # Create an instance of the FastAPI application
 app = FastAPI()
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
 LAST_UPLOADED_TEXT = ""
 
 class SummarizeRequest(BaseModel):
