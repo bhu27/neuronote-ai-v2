@@ -15,6 +15,14 @@ load_dotenv()
 
 # Create an instance of the FastAPI application
 app = FastAPI()
+LAST_UPLOADED_TEXT = ""
+
+class SummarizeRequest(BaseModel):
+    pass
+
+class ChatRequest(BaseModel):
+    question: str
+
 
 # Initialize SentenceTransformer model
 embedding_model = SentenceTransformer('all-MiniLM-L6-v2')
@@ -56,47 +64,83 @@ def chunk_text(text: str, chunk_size: int = 500, overlap: int = 50) -> list[str]
 
 @app.post("/upload-pdf")
 async def upload_pdf(file: UploadFile = File(...)):
-    # Save the file locally
-    file_path = os.path.join(UPLOAD_DIR, file.filename)
+
+    filename = file.filename  # ✅ FIX: safe reuse
+
+    file_path = os.path.join(UPLOAD_DIR, filename)
+
+    # Save file
     with open(file_path, "wb") as f:
         content = await file.read()
         f.write(content)
-    
-    # Extract text using PyPDF
+
+    # Extract text
     extracted_text = ""
+
     try:
         reader = pypdf.PdfReader(file_path)
+
         for page in reader.pages:
             text = page.extract_text()
             if text:
                 extracted_text += text + "\n"
+
     except Exception as e:
-        return {"filename": file.filename, "error": f"Failed to extract PDF text: {str(e)}"}
-        
-    # Split the extracted text into chunks
-    text_content = extracted_text.strip()
-    chunks = chunk_text(text_content)
-    
+        return {"error": f"PDF read failed: {str(e)}"}
+
+    extracted_text = extracted_text.strip()
+
+    if not extracted_text:
+        return {"error": "No text found in PDF"}
+
+    # =========================
+    # 🔹 CHUNK STORAGE (RAG)
+    # =========================
+    chunks = chunk_text(extracted_text)
+
     if chunks:
-        # Convert text chunks to embeddings
-        embeddings = embedding_model.encode(chunks).tolist()
-        
-        # Create unique IDs and metadata for each chunk
-        ids = [f"{file.filename}_chunk_{i}" for i in range(len(chunks))]
-        metadatas = [{"filename": file.filename} for _ in range(len(chunks))]
-        
-        # Store embeddings locally in ChromaDB
+        chunk_embeddings = embedding_model.encode(chunks).tolist()
+
+        chunk_ids = [f"{filename}_chunk_{i}" for i in range(len(chunks))]
+
+        chunk_metadata = [
+            {
+                "filename": filename,
+                "type": "chunk"
+            }
+            for _ in chunks
+        ]
+
         collection.add(
             documents=chunks,
-            embeddings=embeddings,
-            ids=ids,
-            metadatas=metadatas
+            embeddings=chunk_embeddings,
+            ids=chunk_ids,
+            metadatas=chunk_metadata
         )
-        
+
+    # =========================
+    # 🔹 FULL TEXT STORAGE (SUMMARY + MINDMAP)
+    # =========================
+    full_id = f"{filename}_full"
+
+    full_embedding = embedding_model.encode(
+        " ".join(extracted_text.split()[:4000])  # safe limit
+    ).tolist()
+
+    collection.add(
+        documents=[extracted_text],
+        embeddings=[full_embedding],
+        ids=[full_id],
+        metadatas=[{
+            "filename": filename,
+            "type": "full_pdf"
+        }]
+    )
+
     return {
-        "filename": file.filename,
-        "total_chunks": len(chunks),
-        "message": "Text successfully extracted, embedded, and stored in ChromaDB."
+        "message": "Upload successful",
+        "chunks": len(chunks),
+        "text_length": len(extracted_text)
     }
 
 @app.get("/search")
@@ -242,4 +286,113 @@ Question:
         "answer": answer
     }
 
+
+@app.get("/summarize")
+async def summarize_pdf(mode: str = "quick"):
+
+    # 1. Get full PDF from DB
+    results = collection.get(where={"type": "full_pdf"})
+    docs = results.get("documents", [])
+
+    if not docs:
+        return {"error": "No PDF found. Please upload first."}
+
+    full_text = docs[-1] if docs else ""
+
+    if not full_text.strip() or len(full_text.strip()) < 50:
+        return {"error": "PDF too small to summarize."}
+
+    # 2. Limit size (VERY IMPORTANT)
+    full_text = " ".join(full_text.split()[:4000])
+
+    # 3. Strong prompt control (IMPORTANT FIX)
+    prompt = f"""
+You are an expert academic assistant.
+
+MODE: {mode}
+
+YOU MUST FOLLOW MODE STRICTLY:
+
+- quick → ONLY 5 bullet points
+- exam → structured exam notes with headings + key definitions
+- beginner → simple explanation with examples
+
+RULES:
+- Follow ONLY the selected mode
+- Do NOT mix modes
+- Do NOT add extra information outside the mode
+
+TEXT:
+{full_text}
+"""
+
+    # 4. Call LLM
+    result = call_openrouter(prompt)
+
+    return {
+        "status": "success",
+        "mode": mode,
+        "summary": result
+    }
+
+@app.get("/mindmap")
+async def generate_mindmap():
+
+    # 1. Get full PDF
+    results = collection.get(where={"type": "full_pdf"})
+    docs = results.get("documents", [])
+
+    if not docs:
+        return {"error": "No PDF found. Please upload first."}
+
+    full_text = docs[-1]
+
+    if len(full_text.strip()) < 50:
+        return {"error": "PDF too small to generate mindmap."}
+
+    # 2. Trim text
+    trimmed_text = " ".join(full_text.split()[:4000])
+
+    # 3. Prompt
+    prompt = f"""
+You are a mind map generator.
+
+Convert the text into a hierarchical mind map.
+
+STRICT RULES:
+- ONLY valid JSON
+- NO markdown
+- NO explanation
+- NO extra text
+
+FORMAT:
+{{
+  "topic": "Main Topic",
+  "subtopics": [
+    {{
+      "name": "Subtopic",
+      "points": ["point1", "point2"]
+    }}
+  ]
+}}
+
+TEXT:
+{trimmed_text}
+"""
+
+    # 4. Call LLM
+    result_text = call_openrouter(prompt)
+
+    # 5. Clean response
+    result_text = result_text.replace("```json", "").replace("```", "")
+
+    try:
+        result_json = json.loads(result_text)
+    except:
+        result_json = {"raw": result_text}
+
+    return {
+        "status": "success",
+        "mindmap": result_json
+    }
 
